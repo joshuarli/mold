@@ -22,15 +22,15 @@
 # only the latest version of each package, so its packages can't be pinned.
 #
 # The mold executable created by this script is dynamically linked to the
-# system C runtime and other standard system libraries. We can't statically
-# link glibc or musl because doing so would disable dlopen(), which is
-# required to load the LTO linker plugin.
+# system C runtime and other standard system libraries. The musl builds link
+# the GCC runtime statically. We can't statically link glibc or musl because
+# doing so would disable dlopen(), which is required to load the LTO plugin.
 #
 # We use a reasonably old Debian version for the build environment because
 # a binary dynamically linked against a newer version of glibc won't work
 # on a system with an older version of glibc. Likewise, a binary built on a
-# newer Alpine may use functions that an older musl or libgcc doesn't have,
-# so the musl builds use the oldest Alpine release that is still supported.
+# newer Alpine may use functions that an older musl doesn't have, so the musl
+# builds use the oldest Alpine release that is still supported.
 #
 # The Rust toolchain is downloaded from the official Rust distribution
 # site. Its version and SHA-256 hash are recorded below, so the toolchain
@@ -43,6 +43,17 @@
 
 set -e -x
 cd "$(dirname "$0")"
+
+if [ "${1-}" = --verify-musl ]; then
+  mkdir -p dist/verify-musl
+  tar -xzf dist/mold-*-linux-musl.tar.gz -C dist/verify-musl
+  readelf -d dist/verify-musl/mold-*/bin/mold > dist/verify-musl/dynamic
+  awk '/\(NEEDED\)/ { print; if ($NF !~ /^\[(libc\.musl-[^]]+\.so\.1|ld-musl-[^]]+\.so\.1)\]$/) bad = 1; seen = 1 } END { exit (!seen || bad) }' dist/verify-musl/dynamic
+  root=$(pwd)
+  podman run --rm -v "$root/dist/verify-musl:/release:ro" ubuntu:26.04 sh -c \
+    'apt-get update && apt-get install -y --no-install-recommends musl && /release/mold-*/bin/mold --version'
+  exit
+fi
 
 # The executable embeds the hash of the Git commit it is built from, and
 # the commit's timestamp is used as the file timestamp, so this script
@@ -207,12 +218,32 @@ podman run --arch "$arch" -it --rm --userns=host --pids-limit=-1 \
 # build artifacts to appear as if they were built at a specific time.
 # Fixed source, vendor and target paths keep embedded build paths stable.
 podman run --arch "$arch" -it --rm --userns=host --pids-limit=-1 --network=none \
-  --pull=never --env SOURCE_DATE_EPOCH="$timestamp" --env DEST="$dest" \
+  --pull=never --env SOURCE_DATE_EPOCH="$timestamp" --env DEST="$dest" --env OS="$os" \
   -v "$(pwd):/mold:ro" -v "$(pwd)/dist:/dist" \
   -v "$(pwd)/target/dist-vendor-$arch:/vendor:ro" "$image" \
   $setarch bash -c '
 set -e
 export CARGO_TARGET_DIR=/build/target
+if [ "$OS" = linux-musl ]; then
+  mkdir -p /build
+  cat > /build/musl-linker <<EOF
+#!/bin/sh
+count=\$#
+while [ "\$count" -gt 0 ]; do
+  arg=\$1
+  shift
+  if [ "\$arg" = -lgcc_s ]; then
+    set -- "\$@" -Wl,-Bstatic -lgcc_eh -lgcc -Wl,-Bdynamic
+  else
+    set -- "\$@" "\$arg"
+  fi
+  count=\$((count - 1))
+done
+exec cc "\$@"
+EOF
+  chmod +x /build/musl-linker
+  export RUSTFLAGS="-Cllvm-args=-addrsig -Ctarget-feature=-crt-static -Clinker=/build/musl-linker -Clink-arg=-static-libstdc++ -Clink-arg=-static-libgcc"
+fi
 cd /mold
 cargo build --release --frozen --config /vendor/config.toml --package mold
 
@@ -229,6 +260,10 @@ cp $CARGO_TARGET_DIR/release/mold /build/stage1
 stage=/build/$DEST
 DESTDIR=/build PREFIX=/$DEST ./install-mold.sh
 strip --strip-unneeded "$stage/bin/mold"
+if [ "$OS" = linux-musl ]; then
+  readelf -d "$stage/bin/mold" > /build/dynamic
+  awk "/\\(NEEDED\\)/ { print; if (\$NF !~ /^\\[(libc\\.musl-[^]]+\\.so\\.1|ld-musl-[^]]+\\.so\\.1)\\]$/) bad = 1; seen = 1 } END { exit (!seen || bad) }" /build/dynamic
+fi
 find "$stage" -print | xargs touch --no-dereference --date="@$SOURCE_DATE_EPOCH"
 cd /build
 find "$DEST" -print | sort | tar -cf - --no-recursion --files-from=- | gzip -9nc > "/dist/$DEST.tar.gz"
